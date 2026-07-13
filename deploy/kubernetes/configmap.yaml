@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mini-commerce-config
+  namespace: mini-commerce
+data:
+  ASPNETCORE_ENVIRONMENT: "Production"
+  ServiceBus__Enabled: "true"
+  ServiceBus__TopicName: "orders"
+  ServiceBus__SubscriptionName: "notification-service"
+  Services__Inventory: "http://inventory-service:8080"
+  Services__Notification: "http://notification-service:8080"
+  Jwt__Issuer: "MiniCommerce"
+  Jwt__Audience: "MiniCommerce"
+  Cors__AllowedOrigins__0: "https://YOUR_STOREFRONT_ORIGIN"

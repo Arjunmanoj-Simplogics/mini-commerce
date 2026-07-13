@@ -1,0 +1,23 @@
+# Snippet: add to each Deployment pod spec for Key Vault CSI
+#
+# serviceAccountName: mini-commerce-workload
+# volumes:
+#   - name: secrets-store
+#     csi:
+#       driver: secrets-store.csi.k8s.io
+#       readOnly: true
+#       volumeAttributes:
+#         secretProviderClass: mini-commerce-keyvault
+# containers[].volumeMounts:
+#   - name: secrets-store
+#     mountPath: /mnt/secrets-store
+#     readOnly: true
+#
+# After CSI sync, env can keep using secretKeyRef on mini-commerce-secrets.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: csi-volume-docs
+  namespace: mini-commerce
+data:
+  note: "See keyvault-csi.md — this ConfigMap is a placeholder so the snippet file is valid YAML."

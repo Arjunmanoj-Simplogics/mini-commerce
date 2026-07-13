@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-service
+  namespace: mini-commerce
+  labels:
+    app: auth-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: auth-service
+  template:
+    metadata:
+      labels:
+        app: auth-service
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: mini-commerce-workload
+      containers:
+        - name: auth-service
+          image: auth-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: secrets-store
+              mountPath: "/mnt/secrets-store"
+              readOnly: true
+          env:
+            - name: ASPNETCORE_URLS
+              value: "http://+:8080"
+            - name: Jwt__Issuer
+              value: "MiniCommerce"
+            - name: Jwt__Audience
+              value: "MiniCommerce"
+            - name: ConnectionStrings__AuthDB
+              valueFrom:
+                secretKeyRef:
+                  name: mini-commerce-secrets
+                  key: ConnectionStrings__AuthDB
+            - name: Jwt__SigningKey
+              valueFrom:
+                secretKeyRef:
+                  name: mini-commerce-secrets
+                  key: Jwt__SigningKey
+          readinessProbe:
+            httpGet:
+              path: /api/health/ready
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health/live
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+      volumes:
+        - name: secrets-store
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: "mini-commerce-keyvault"

@@ -1,0 +1,27 @@
+## Build artifacts
+**/bin/
+**/obj/
+**/dist/
+**/node_modules/
+
+## IDE
+.vs/
+.vscode/
+*.user
+*.suo
+
+## Environment
+.env
+.env.local
+!.env.example
+
+## OS
+Thumbs.db
+.DS_Store
+
+## Logs
+*.log
+
+## Test results
+TestResults/
+coverage/

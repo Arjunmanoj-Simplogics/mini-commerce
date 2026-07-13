@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+  namespace: mini-commerce
+  labels:
+    app: order-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: order-service
+  template:
+    metadata:
+      labels:
+        app: order-service
+    spec:
+      serviceAccountName: mini-commerce-workload
+      containers:
+        - name: order-service
+          image: order-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: secrets-store
+              mountPath: "/mnt/secrets-store"
+              readOnly: true
+          env:
+            - name: ASPNETCORE_URLS
+              value: "http://+:8080"
+            - name: Database__AutoMigrate
+              value: "true"
+            - name: ASPNETCORE_ENVIRONMENT
+              valueFrom:
+                configMapKeyRef:
+                  name: mini-commerce-config
+                  key: ASPNETCORE_ENVIRONMENT
+            - name: ServiceBus__Enabled
+              valueFrom:
+                configMapKeyRef:
+                  name: mini-commerce-config
+                  key: ServiceBus__Enabled
+            - name: ServiceBus__TopicName
+              valueFrom:
+                configMapKeyRef:
+                  name: mini-commerce-config
+                  key: ServiceBus__TopicName
+            - name: Services__Inventory
+              valueFrom:
+                configMapKeyRef:
+                  name: mini-commerce-config
+                  key: Services__Inventory
+            - name: ConnectionStrings__OrderDB
+              valueFrom:
+                secretKeyRef:
+                  name: mini-commerce-secrets
+                  key: ConnectionStrings__OrderDB
+            - name: ServiceBus__ConnectionString
+              valueFrom:
+                secretKeyRef:
+                  name: mini-commerce-secrets
+                  key: ServiceBus__ConnectionString
+          readinessProbe:
+            httpGet:
+              path: /api/health/ready
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health/live
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+      volumes:
+        - name: secrets-store
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: "mini-commerce-keyvault"
