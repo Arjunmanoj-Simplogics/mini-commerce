@@ -1,10 +1,14 @@
 using FluentValidation;
 using InventoryService.Application.DTOs;
+using InventoryService.Application.Exceptions;
 using InventoryService.Application.Interfaces;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using MiniCommerce.BuildingBlocks.Auth;
+using MiniCommerce.Contracts.Events;
 using MiniCommerce.Contracts.Inventory;
+using MiniCommerce.Contracts.Messaging;
+using MiniCommerce.Messaging.Abstractions;
 
 namespace InventoryService.API.Controllers;
 
@@ -15,15 +19,21 @@ public class InventoryController : ControllerBase
     private readonly IInventoryService _service;
     private readonly IValidator<CreateInventoryItemDto> _createValidator;
     private readonly IValidator<UpdateInventoryItemDto> _updateValidator;
+    private readonly IMessagePublisher _messagePublisher;
+    private readonly ILogger<InventoryController> _logger;
 
     public InventoryController(
         IInventoryService service,
         IValidator<CreateInventoryItemDto> createValidator,
-        IValidator<UpdateInventoryItemDto> updateValidator)
+        IValidator<UpdateInventoryItemDto> updateValidator,
+        IMessagePublisher messagePublisher,
+        ILogger<InventoryController> logger)
     {
         _service = service;
         _createValidator = createValidator;
         _updateValidator = updateValidator;
+        _messagePublisher = messagePublisher;
+        _logger = logger;
     }
 
     [HttpGet]
@@ -65,10 +75,43 @@ public class InventoryController : ControllerBase
 
     /// <summary>
     /// Reserves stock for an order (called by Order Service).
+    /// Publishes InventoryReserved or InventoryFailed integration events (when Service Bus is enabled).
     /// </summary>
     [HttpPost("reserve")]
     public async Task<ActionResult<ReserveStockResponse>> Reserve([FromBody] ReserveStockRequest request, CancellationToken cancellationToken)
-        => Ok(await _service.ReserveAsync(request, cancellationToken));
+    {
+        try
+        {
+            var result = await _service.ReserveAsync(request, cancellationToken);
+            await PublishSafeAsync(
+                ServiceBusNames.InventoryReserved,
+                new InventoryReservedEvent
+                {
+                    OrderId = request.OrderId,
+                    ProductSku = request.ProductSku,
+                    Quantity = request.Quantity,
+                    RemainingQuantity = result.RemainingQuantity
+                },
+                request.OrderId.ToString("N"),
+                cancellationToken);
+            return Ok(result);
+        }
+        catch (InsufficientStockException ex)
+        {
+            await PublishSafeAsync(
+                ServiceBusNames.InventoryFailed,
+                new InventoryFailedEvent
+                {
+                    OrderId = request.OrderId,
+                    ProductSku = request.ProductSku,
+                    Quantity = request.Quantity,
+                    Reason = ex.Message
+                },
+                request.OrderId.ToString("N"),
+                cancellationToken);
+            throw;
+        }
+    }
 
     /// <summary>
     /// Releases reserved stock (called by Order Service on cancel/delete).
@@ -78,5 +121,17 @@ public class InventoryController : ControllerBase
     {
         await _service.ReleaseAsync(request, cancellationToken);
         return NoContent();
+    }
+
+    private async Task PublishSafeAsync<T>(string eventType, T payload, string correlationId, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await _messagePublisher.PublishAsync(eventType, payload, correlationId, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to publish {EventType} CorrelationId={CorrelationId}", eventType, correlationId);
+        }
     }
 }

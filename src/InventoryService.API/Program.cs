@@ -1,16 +1,20 @@
+using System.Diagnostics;
 using System.Net;
 using System.Text.Json;
 using FluentValidation;
 using InventoryService.Application;
-using InventoryService.Application.DTOs;
 using InventoryService.Application.Exceptions;
-using InventoryService.Application.Interfaces;
 using InventoryService.Infrastructure;
 using Microsoft.EntityFrameworkCore;
+using MiniCommerce.AzureAuth;
 using MiniCommerce.BuildingBlocks.Auth;
-using MiniCommerce.Contracts.Inventory;
+using MiniCommerce.BuildingBlocks.Configuration;
+using MiniCommerce.BuildingBlocks.Health;
+using MiniCommerce.BuildingBlocks.Hosting;
+using MiniCommerce.BuildingBlocks.Logging;
+using MiniCommerce.BuildingBlocks.Observability;
+using MiniCommerce.Messaging.DependencyInjection;
 using Serilog;
-using Serilog.Events;
 
 namespace InventoryService.API;
 
@@ -20,6 +24,7 @@ public class Program
     {
         Log.Logger = new LoggerConfiguration()
             .MinimumLevel.Information()
+            .Enrich.FromLogContext()
             .WriteTo.Console()
             .CreateBootstrapLogger();
 
@@ -30,7 +35,15 @@ public class Program
             builder.Host.UseSerilog((ctx, _, cfg) => cfg
                 .ReadFrom.Configuration(ctx.Configuration)
                 .Enrich.FromLogContext()
+                .Enrich.WithProperty("ServiceName", "InventoryService")
                 .WriteTo.Console());
+
+            builder.Services.AddMiniCommerceAzureCredential(builder.Configuration);
+            builder.AddKeyVaultConfiguration();
+            builder.AddMiniCommerceAksHosting();
+            builder.Services.AddMiniCommerceOptions(builder.Configuration);
+            builder.Services.AddMiniCommerceTelemetry(builder.Configuration);
+            new ServiceBusServiceRegistrar().Register(builder.Services, builder.Configuration, registerConsumer: false);
 
             builder.Services.AddControllers();
             builder.Services.AddEndpointsApiExplorer();
@@ -39,13 +52,9 @@ public class Program
                 o.SwaggerDoc("v1", new() { Title = "Inventory Service API", Version = "v1" });
             });
 
-            var connectionString = builder.Configuration.GetConnectionString("InventoryDB");
-            builder.Services.AddHealthChecks()
-                .AddCheck("self", () => Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckResult.Healthy(), tags: ["live"])
-                .AddSqlServer(connectionString ?? "Server=.;Database=InventoryDB;Trusted_Connection=True;", name: "sqlserver", tags: ["ready"]);
-
-            var origins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>() ?? ["http://localhost:5173"];
-            builder.Services.AddCors(o => o.AddPolicy("FrontendPolicy", p => p.WithOrigins(origins).AllowAnyHeader().AllowAnyMethod()));
+            var connectionString = builder.Configuration.GetRequiredSqlConnectionString(ConnectionStringNames.InventoryDB);
+            builder.Services.AddMiniCommerceHealthChecks(builder.Configuration, connectionString);
+            builder.Services.AddMiniCommerceCors(builder.Configuration);
 
             builder.Services.AddApplication();
             builder.Services.AddInfrastructure(builder.Configuration);
@@ -53,7 +62,9 @@ public class Program
 
             var app = builder.Build();
 
-            app.UseSerilogRequestLogging();
+            app.UseMiniCommerceForwardedHeaders();
+            app.UseMiniCommerceHttpsRedirection();
+            app.UseMiniCommerceStructuredLogging();
             if (app.Environment.IsDevelopment())
             {
                 app.UseSwagger();
@@ -66,15 +77,13 @@ public class Program
                 catch (Exception ex) { await WriteError(context, ex, app.Environment); }
             });
 
-            app.UseCors("FrontendPolicy");
+            app.UseCors(CorsOptions.FrontendPolicyName);
             app.UseAuthentication();
             app.UseAuthorization();
             app.MapControllers();
-            app.MapHealthChecks("/api/health");
-            app.MapHealthChecks("/api/health/live", new() { Predicate = c => c.Tags.Contains("live") });
-            app.MapHealthChecks("/api/health/ready", new() { Predicate = c => c.Tags.Contains("ready") });
+            app.MapMiniCommerceHealthEndpoints();
 
-            if (builder.Configuration.GetValue("Database:AutoMigrate", true))
+            if (builder.Configuration.GetSection(SqlOptions.SectionName).Get<SqlOptions>()?.AutoMigrate ?? true)
             {
                 await app.Services.InitializeDatabaseAsync();
             }
@@ -102,7 +111,28 @@ public class Program
             _ => (HttpStatusCode.InternalServerError, "An unexpected error occurred")
         };
 
-        Log.Error(exception, "Unhandled exception");
+        var logger = context.RequestServices.GetRequiredService<ILoggerFactory>()
+            .CreateLogger("InventoryService.API.Exceptions");
+
+        var correlationId = context.Items.TryGetValue(LoggingContextKeys.CorrelationId, out var c) ? c?.ToString() : null
+            ?? context.Request.Headers[CorrelationLoggingMiddleware.CorrelationHeader].FirstOrDefault()
+            ?? string.Empty;
+        var requestId = context.Items.TryGetValue(LoggingContextKeys.RequestId, out var r) ? r?.ToString() : null
+            ?? context.TraceIdentifier;
+        var traceId = context.Items.TryGetValue(LoggingContextKeys.TraceId, out var t) ? t?.ToString() : null
+            ?? Activity.Current?.TraceId.ToString()
+            ?? context.TraceIdentifier;
+
+        logger.LogError(
+            exception,
+            "Unhandled exception for HTTP {RequestMethod} {RequestPath} CorrelationId={CorrelationId} RequestId={RequestId} TraceId={TraceId} Exception={ExceptionType}",
+            context.Request.Method,
+            context.Request.Path,
+            correlationId,
+            requestId,
+            traceId,
+            exception.GetType().Name);
+
         context.Response.ContentType = "application/problem+json";
         context.Response.StatusCode = (int)status;
         await context.Response.WriteAsync(JsonSerializer.Serialize(new
@@ -110,7 +140,9 @@ public class Program
             title,
             status = (int)status,
             detail = env.IsDevelopment() ? exception.Message : title,
-            traceId = context.TraceIdentifier
+            traceId,
+            correlationId,
+            requestId
         }));
     }
 }

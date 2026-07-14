@@ -4,6 +4,8 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\MiniCommerce.BuildingBlocks\MiniCommerce.BuildingBlocks.csproj" />
+    <ProjectReference Include="..\MiniCommerce.Messaging\MiniCommerce.Messaging.csproj" />
+    <ProjectReference Include="..\MiniCommerce.Contracts\MiniCommerce.Contracts.csproj" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="9.0.0" />

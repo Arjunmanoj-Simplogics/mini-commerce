@@ -1,7 +1,16 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using MiniCommerce.AzureAuth;
 using MiniCommerce.BuildingBlocks.Auth;
+using MiniCommerce.BuildingBlocks.Configuration;
+using MiniCommerce.BuildingBlocks.Data;
+using MiniCommerce.BuildingBlocks.Health;
+using MiniCommerce.BuildingBlocks.Hosting;
+using MiniCommerce.BuildingBlocks.Logging;
+using MiniCommerce.BuildingBlocks.Observability;
+using MiniCommerce.Storage.Abstractions;
+using MiniCommerce.Storage.DependencyInjection;
 using Serilog;
 
 namespace CatalogService.API;
@@ -51,8 +60,14 @@ public record UpdateProductRequest(string Name, string Description, string Categ
 public class CatalogController : ControllerBase
 {
     private readonly CatalogDbContext _db;
+    private readonly IBlobStorageService? _blobStorage;
 
-    public CatalogController(CatalogDbContext db) => _db = db;
+    public CatalogController(CatalogDbContext db, IServiceProvider services)
+    {
+        _db = db;
+        // Optional: registered only when BlobStorage:Enabled=true
+        _blobStorage = services.GetService<IBlobStorageService>();
+    }
 
     [HttpGet]
     [AllowAnonymous]
@@ -130,6 +145,43 @@ public class CatalogController : ControllerBase
         return Ok(new ProductDto(product.Id, product.Sku, product.Name, product.Description, product.Category, product.ImageUrl, product.Price, product.IsActive));
     }
 
+    /// <summary>
+    /// Uploads a product image to Azure Blob Storage and stores only the blob URL in SQL.
+    /// Requires BlobStorage:Enabled=true.
+    /// </summary>
+    [HttpPost("{id:guid}/image")]
+    [Authorize(Roles = AuthRoles.Admin)]
+    [RequestSizeLimit(10_000_000)]
+    public async Task<ActionResult<ProductDto>> UploadImage(Guid id, IFormFile file, CancellationToken ct)
+    {
+        if (_blobStorage is null)
+        {
+            return StatusCode(StatusCodes.Status503ServiceUnavailable,
+                new { title = "Blob storage is not enabled. Set BlobStorage:Enabled=true." });
+        }
+
+        if (file is null || file.Length == 0)
+        {
+            return BadRequest(new { title = "A non-empty image file is required." });
+        }
+
+        var product = await _db.Products.FirstOrDefaultAsync(p => p.Id == id, ct);
+        if (product is null) return NotFound();
+
+        var extension = Path.GetExtension(file.FileName);
+        if (string.IsNullOrWhiteSpace(extension)) extension = ".bin";
+        var blobName = $"products/{id:N}/{Guid.NewGuid():N}{extension}";
+
+        await using var stream = file.OpenReadStream();
+        var blobUrl = await _blobStorage.UploadAsync(stream, blobName, file.ContentType, ct);
+
+        product.ImageUrl = blobUrl;
+        product.UpdatedDate = DateTime.UtcNow;
+        await _db.SaveChangesAsync(ct);
+
+        return Ok(new ProductDto(product.Id, product.Sku, product.Name, product.Description, product.Category, product.ImageUrl, product.Price, product.IsActive));
+    }
+
     [HttpDelete("{id:guid}")]
     [Authorize(Roles = AuthRoles.Admin)]
     public async Task<IActionResult> Delete(Guid id, CancellationToken ct)
@@ -151,36 +203,45 @@ public class Program
         try
         {
             var builder = WebApplication.CreateBuilder(args);
-            builder.Host.UseSerilog((_, _, c) => c.WriteTo.Console());
+            builder.Host.UseSerilog((_, _, c) => c
+                .WriteTo.Console()
+                .Enrich.FromLogContext()
+                .Enrich.WithProperty("ServiceName", "CatalogService"));
+
+            builder.Services.AddMiniCommerceAzureCredential(builder.Configuration);
+            builder.AddKeyVaultConfiguration();
+            builder.AddMiniCommerceAksHosting();
+            builder.Services.AddMiniCommerceOptions(builder.Configuration);
+            builder.Services.AddMiniCommerceTelemetry(builder.Configuration);
+            new BlobStorageServiceRegistrar().Register(builder.Services, builder.Configuration);
 
             builder.Services.AddControllers();
             builder.Services.AddEndpointsApiExplorer();
             builder.Services.AddSwaggerGen();
             builder.Services.AddMiniCommerceJwtAuthentication(builder.Configuration);
 
-            var cs = builder.Configuration.GetConnectionString("CatalogDB")
-                ?? throw new InvalidOperationException("ConnectionStrings:CatalogDB is required.");
-            builder.Services.AddDbContext<CatalogDbContext>(o => o.UseSqlServer(cs));
-            builder.Services.AddHealthChecks()
-                .AddCheck("self", () => Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckResult.Healthy(), tags: ["live"])
-                .AddSqlServer(cs, name: "sqlserver", tags: ["ready"]);
-
-            var origins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>() ?? ["http://localhost:5173"];
-            builder.Services.AddCors(o => o.AddPolicy("FrontendPolicy", p => p.WithOrigins(origins).AllowAnyHeader().AllowAnyMethod()));
+            var cs = builder.Configuration.GetRequiredSqlConnectionString(ConnectionStringNames.CatalogDB);
+            builder.Services.AddDbContext<CatalogDbContext>(o =>
+                o.UseAzureSqlServer(cs, builder.Configuration));
+            builder.Services.AddMiniCommerceHealthChecks(builder.Configuration, cs);
+            builder.Services.AddMiniCommerceCors(builder.Configuration);
 
             var app = builder.Build();
+            app.UseMiniCommerceForwardedHeaders();
+            app.UseMiniCommerceHttpsRedirection();
+            app.UseMiniCommerceStructuredLogging();
             if (app.Environment.IsDevelopment()) { app.UseSwagger(); app.UseSwaggerUI(); }
-            app.UseCors("FrontendPolicy");
+            app.UseCors(CorsOptions.FrontendPolicyName);
             app.UseAuthentication();
             app.UseAuthorization();
             app.MapControllers();
-            app.MapHealthChecks("/api/health");
-            app.MapHealthChecks("/api/health/live", new() { Predicate = c => c.Tags.Contains("live") });
-            app.MapHealthChecks("/api/health/ready", new() { Predicate = c => c.Tags.Contains("ready") });
+            app.MapMiniCommerceHealthEndpoints();
 
             using (var scope = app.Services.CreateScope())
             {
                 var db = scope.ServiceProvider.GetRequiredService<CatalogDbContext>();
+                var logger = scope.ServiceProvider.GetRequiredService<ILoggerFactory>().CreateLogger("CatalogService.Sql");
+                await AzureSqlExtensions.VerifySqlConnectivityAsync(cs, logger, "CatalogDB");
                 await db.Database.EnsureCreatedAsync();
                 if (!await db.Products.AnyAsync())
                 {

@@ -6,6 +6,7 @@
     <ProjectReference Include="..\NotificationService.Application\NotificationService.Application.csproj" />
     <ProjectReference Include="..\NotificationService.Infrastructure\NotificationService.Infrastructure.csproj" />
     <ProjectReference Include="..\MiniCommerce.Contracts\MiniCommerce.Contracts.csproj" />
+    <ProjectReference Include="..\MiniCommerce.BuildingBlocks\MiniCommerce.BuildingBlocks.csproj" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="AspNetCore.HealthChecks.SqlServer" Version="9.0.0" />

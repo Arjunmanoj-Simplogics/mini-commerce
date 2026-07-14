@@ -2,6 +2,10 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata.Builders;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using MiniCommerce.BuildingBlocks.Configuration;
+using MiniCommerce.BuildingBlocks.Data;
+using MiniCommerce.Messaging.Abstractions;
 using NotificationService.Application.Interfaces;
 using NotificationService.Domain.Entities;
 using NotificationService.Infrastructure.Messaging;
@@ -58,16 +62,13 @@ public static class DependencyInjection
 {
     public static IServiceCollection AddInfrastructure(this IServiceCollection services, IConfiguration configuration)
     {
-        var connectionString = configuration.GetConnectionString("NotificationDB")
-            ?? throw new InvalidOperationException("Connection string 'NotificationDB' is not configured.");
+        var connectionString = configuration.GetRequiredSqlConnectionString(ConnectionStringNames.NotificationDB);
 
         services.AddDbContext<NotificationDbContext>(options =>
-            options.UseSqlServer(connectionString, sql => sql.EnableRetryOnFailure(3)));
+            options.UseAzureSqlServer(connectionString, configuration));
 
         services.AddScoped<INotificationRepository, NotificationRepository>();
-
-        services.Configure<ServiceBusOptions>(configuration.GetSection(ServiceBusOptions.SectionName));
-        services.AddHostedService<OrderEventsConsumer>();
+        services.AddScoped<IMessageHandler, OrderEventsMessageHandler>();
 
         return services;
     }
@@ -76,6 +77,11 @@ public static class DependencyInjection
     {
         using var scope = serviceProvider.CreateScope();
         var context = scope.ServiceProvider.GetRequiredService<NotificationDbContext>();
+        var logger = scope.ServiceProvider.GetRequiredService<ILoggerFactory>().CreateLogger("NotificationService.Sql");
+        var configuration = scope.ServiceProvider.GetRequiredService<IConfiguration>();
+        var connectionString = configuration.GetRequiredSqlConnectionString(ConnectionStringNames.NotificationDB);
+
+        await AzureSqlExtensions.VerifySqlConnectivityAsync(connectionString, logger, "NotificationDB");
         await context.Database.EnsureCreatedAsync();
     }
 }

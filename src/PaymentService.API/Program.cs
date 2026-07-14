@@ -1,7 +1,16 @@
-using System.Collections.Concurrent;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using MiniCommerce.AzureAuth;
 using MiniCommerce.BuildingBlocks.Auth;
+using MiniCommerce.BuildingBlocks.Configuration;
+using MiniCommerce.BuildingBlocks.Health;
+using MiniCommerce.BuildingBlocks.Hosting;
+using MiniCommerce.BuildingBlocks.Logging;
+using MiniCommerce.BuildingBlocks.Observability;
+using MiniCommerce.Contracts.Events;
+using MiniCommerce.Contracts.Messaging;
+using MiniCommerce.Messaging.Abstractions;
+using MiniCommerce.Messaging.DependencyInjection;
 using Serilog;
 
 namespace PaymentService.API;
@@ -28,14 +37,27 @@ public record PaymentDto(
 [Route("api/payments")]
 public class PaymentsController : ControllerBase
 {
-    private static readonly ConcurrentDictionary<Guid, PaymentDto> Store = new();
+    private readonly IPaymentStore _store;
+    private readonly IMessagePublisher _messagePublisher;
+    private readonly ILogger<PaymentsController> _logger;
+
+    public PaymentsController(
+        IPaymentStore store,
+        IMessagePublisher messagePublisher,
+        ILogger<PaymentsController> logger)
+    {
+        _store = store;
+        _messagePublisher = messagePublisher;
+        _logger = logger;
+    }
 
     /// <summary>
     /// Mock charge. Cards ending in 0000 fail; otherwise succeeds.
+    /// On success, publishes PaymentCompleted (when Service Bus is enabled).
     /// </summary>
     [HttpPost("charge")]
     [Authorize]
-    public ActionResult<PaymentDto> Charge([FromBody] ChargeRequest request)
+    public async Task<ActionResult<PaymentDto>> Charge([FromBody] ChargeRequest request, CancellationToken cancellationToken)
     {
         if (request.Amount <= 0)
         {
@@ -71,14 +93,40 @@ public class PaymentsController : ControllerBase
             last4,
             DateTime.UtcNow);
 
-        Store[payment.PaymentId] = payment;
+        await _store.SaveAsync(payment, cancellationToken);
+
+        if (!failed)
+        {
+            try
+            {
+                await _messagePublisher.PublishAsync(
+                    ServiceBusNames.PaymentCompleted,
+                    new PaymentCompletedEvent
+                    {
+                        PaymentId = payment.PaymentId,
+                        ChargedAmount = payment.ChargedAmount,
+                        Currency = payment.Currency,
+                        Last4 = payment.Last4
+                    },
+                    payment.PaymentId.ToString("N"),
+                    cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to publish PaymentCompleted for {PaymentId}", payment.PaymentId);
+            }
+        }
+
         return failed ? UnprocessableEntity(payment) : Ok(payment);
     }
 
     [HttpGet("{id:guid}")]
     [Authorize]
-    public ActionResult<PaymentDto> GetById(Guid id)
-        => Store.TryGetValue(id, out var payment) ? Ok(payment) : NotFound();
+    public async Task<ActionResult<PaymentDto>> GetById(Guid id, CancellationToken cancellationToken)
+    {
+        var payment = await _store.GetAsync(id, cancellationToken);
+        return payment is null ? NotFound() : Ok(payment);
+    }
 }
 
 public class Program
@@ -89,32 +137,41 @@ public class Program
         try
         {
             var builder = WebApplication.CreateBuilder(args);
-            builder.Host.UseSerilog((_, _, c) => c.WriteTo.Console());
+            builder.Host.UseSerilog((_, _, c) => c
+                .WriteTo.Console()
+                .Enrich.FromLogContext()
+                .Enrich.WithProperty("ServiceName", "PaymentService"));
 
+            builder.Services.AddMiniCommerceAzureCredential(builder.Configuration);
+            builder.AddKeyVaultConfiguration();
+            builder.AddMiniCommerceAksHosting();
+            builder.Services.AddMiniCommerceOptions(builder.Configuration);
+            builder.Services.AddMiniCommerceTelemetry(builder.Configuration);
+            new ServiceBusServiceRegistrar().Register(builder.Services, builder.Configuration, registerConsumer: false);
             builder.Services.AddControllers();
             builder.Services.AddEndpointsApiExplorer();
             builder.Services.AddSwaggerGen();
             builder.Services.AddMiniCommerceJwtAuthentication(builder.Configuration);
-            builder.Services.AddHealthChecks()
-                .AddCheck("self", () => Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckResult.Healthy(), tags: ["live", "ready"]);
-
-            var origins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>() ?? ["http://localhost:5173"];
-            builder.Services.AddCors(o => o.AddPolicy("FrontendPolicy", p => p.WithOrigins(origins).AllowAnyHeader().AllowAnyMethod()));
+            builder.Services.AddMiniCommerceHealthChecks(builder.Configuration);
+            builder.Services.AddMiniCommerceCors(builder.Configuration);
+            builder.Services.AddMiniCommerceDistributedCache(builder.Configuration);
+            builder.Services.AddSingleton<IPaymentStore, DistributedPaymentStore>();
 
             var app = builder.Build();
+            app.UseMiniCommerceForwardedHeaders();
+            app.UseMiniCommerceHttpsRedirection();
+            app.UseMiniCommerceStructuredLogging();
             if (app.Environment.IsDevelopment())
             {
                 app.UseSwagger();
                 app.UseSwaggerUI();
             }
 
-            app.UseCors("FrontendPolicy");
+            app.UseCors(CorsOptions.FrontendPolicyName);
             app.UseAuthentication();
             app.UseAuthorization();
             app.MapControllers();
-            app.MapHealthChecks("/api/health");
-            app.MapHealthChecks("/api/health/live", new() { Predicate = c => c.Tags.Contains("live") });
-            app.MapHealthChecks("/api/health/ready", new() { Predicate = c => c.Tags.Contains("ready") });
+            app.MapMiniCommerceHealthEndpoints();
             app.Run();
         }
         catch (Exception ex)

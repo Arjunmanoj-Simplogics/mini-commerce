@@ -44,3 +44,42 @@ public sealed class OrderCancelledEvent
     public int Quantity { get; init; }
     public DateTime OccurredAtUtc { get; init; } = DateTime.UtcNow;
 }
+
+/// <summary>
+/// Integration event raised when a payment charge succeeds.
+/// </summary>
+public sealed class PaymentCompletedEvent
+{
+    public Guid EventId { get; init; } = Guid.NewGuid();
+    public Guid PaymentId { get; init; }
+    public decimal ChargedAmount { get; init; }
+    public string Currency { get; init; } = "USD";
+    public string Last4 { get; init; } = string.Empty;
+    public DateTime OccurredAtUtc { get; init; } = DateTime.UtcNow;
+}
+
+/// <summary>
+/// Integration event raised when inventory stock is reserved for an order.
+/// </summary>
+public sealed class InventoryReservedEvent
+{
+    public Guid EventId { get; init; } = Guid.NewGuid();
+    public Guid OrderId { get; init; }
+    public string ProductSku { get; init; } = string.Empty;
+    public int Quantity { get; init; }
+    public int RemainingQuantity { get; init; }
+    public DateTime OccurredAtUtc { get; init; } = DateTime.UtcNow;
+}
+
+/// <summary>
+/// Integration event raised when inventory reservation fails (e.g. insufficient stock).
+/// </summary>
+public sealed class InventoryFailedEvent
+{
+    public Guid EventId { get; init; } = Guid.NewGuid();
+    public Guid OrderId { get; init; }
+    public string ProductSku { get; init; } = string.Empty;
+    public int Quantity { get; init; }
+    public string Reason { get; init; } = string.Empty;
+    public DateTime OccurredAtUtc { get; init; } = DateTime.UtcNow;
+}

@@ -1,6 +1,9 @@
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using MiniCommerce.BuildingBlocks.Configuration;
+using MiniCommerce.BuildingBlocks.Data;
 using OrderService.Application.Interfaces;
 using OrderService.Infrastructure.DbContext;
 using OrderService.Infrastructure.Repositories;
@@ -16,20 +19,15 @@ public static class DependencyInjection
     /// <summary>
     /// Adds infrastructure services including EF Core and repositories.
     /// </summary>
-    /// <param name="services">The service collection.</param>
-    /// <param name="configuration">The application configuration.</param>
-    /// <returns>The service collection.</returns>
     public static IServiceCollection AddInfrastructure(this IServiceCollection services, IConfiguration configuration)
     {
-        var connectionString = configuration.GetConnectionString("OrderDB")
-            ?? throw new InvalidOperationException("Connection string 'OrderDB' is not configured.");
+        var connectionString = configuration.GetRequiredSqlConnectionString(ConnectionStringNames.OrderDB);
 
         services.AddDbContext<OrderDbContext>(options =>
-            options.UseSqlServer(connectionString, sqlOptions =>
-            {
-                sqlOptions.MigrationsAssembly(typeof(OrderDbContext).Assembly.FullName);
-                sqlOptions.EnableRetryOnFailure(maxRetryCount: 3);
-            }));
+            options.UseAzureSqlServer(
+                connectionString,
+                configuration,
+                migrationsAssembly: typeof(OrderDbContext).Assembly.FullName));
 
         services.AddScoped<IOrderRepository, OrderRepository>();
 
@@ -39,12 +37,17 @@ public static class DependencyInjection
     /// <summary>
     /// Applies database migrations and seeds initial data.
     /// </summary>
-    /// <param name="serviceProvider">The service provider.</param>
-    /// <returns>A task representing the asynchronous operation.</returns>
     public static async Task InitializeDatabaseAsync(this IServiceProvider serviceProvider)
     {
         using var scope = serviceProvider.CreateScope();
         var context = scope.ServiceProvider.GetRequiredService<OrderDbContext>();
+        var logger = scope.ServiceProvider.GetRequiredService<ILoggerFactory>().CreateLogger("OrderService.Sql");
+        var configuration = scope.ServiceProvider.GetRequiredService<IConfiguration>();
+        var connectionString = configuration.GetRequiredSqlConnectionString(ConnectionStringNames.OrderDB);
+
+        // Explicit Microsoft.Data.SqlClient probe before EF migrations
+        await AzureSqlExtensions.VerifySqlConnectivityAsync(connectionString, logger, "OrderDB");
+
         await context.Database.MigrateAsync();
         await OrderDbSeed.SeedAsync(context);
     }

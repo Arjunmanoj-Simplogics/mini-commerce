@@ -14,4 +14,7 @@ public static class ServiceBusNames
     public const string OrderCreated = "OrderCreated";
     public const string OrderStatusChanged = "OrderStatusChanged";
     public const string OrderCancelled = "OrderCancelled";
+    public const string PaymentCompleted = "PaymentCompleted";
+    public const string InventoryReserved = "InventoryReserved";
+    public const string InventoryFailed = "InventoryFailed";
 }

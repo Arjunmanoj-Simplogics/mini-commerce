@@ -3,6 +3,8 @@
 **/obj/
 **/dist/
 **/node_modules/
+artifacts/
+.docker-cache/
 
 ## IDE
 .vs/    

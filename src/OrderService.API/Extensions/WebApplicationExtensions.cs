@@ -1,9 +1,14 @@
 using MiniCommerce.BuildingBlocks.Auth;
-using OrderService.API.Configuration;
+using MiniCommerce.BuildingBlocks.Configuration;
+using MiniCommerce.BuildingBlocks.Health;
+using MiniCommerce.BuildingBlocks.Hosting;
+using MiniCommerce.BuildingBlocks.Logging;
+using MiniCommerce.BuildingBlocks.Observability;
+using MiniCommerce.Messaging.DependencyInjection;
+using MiniCommerce.Messaging.Options;
 using OrderService.API.Middleware;
 using OrderService.Application;
 using OrderService.Infrastructure;
-using Serilog;
 
 namespace OrderService.API.Extensions;
 
@@ -12,14 +17,10 @@ namespace OrderService.API.Extensions;
 /// </summary>
 public static class WebApplicationExtensions
 {
-    /// <summary>
-    /// Configures middleware pipeline for the Order Service API.
-    /// </summary>
-    /// <param name="app">The web application.</param>
-    /// <returns>The web application.</returns>
     public static WebApplication ConfigurePipeline(this WebApplication app)
     {
-        app.UseSerilogRequestLogging();
+        app.UseMiniCommerceForwardedHeaders();
+        app.UseMiniCommerceStructuredLogging();
 
         if (app.Environment.IsDevelopment())
         {
@@ -32,41 +33,23 @@ public static class WebApplicationExtensions
         }
 
         app.UseMiddleware<GlobalExceptionMiddleware>();
-        app.UseMiddleware<RequestLoggingMiddleware>();
 
-        app.UseHttpsRedirection();
-        app.UseCors("FrontendPolicy");
+        app.UseMiniCommerceHttpsRedirection();
+        app.UseCors(CorsOptions.FrontendPolicyName);
         app.UseAuthentication();
         app.UseAuthorization();
         app.MapControllers();
-
-        app.MapHealthChecks("/api/health", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
-        {
-            Predicate = _ => true
-        });
-
-        app.MapHealthChecks("/api/health/live", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
-        {
-            Predicate = check => check.Tags.Contains("live")
-        });
-
-        app.MapHealthChecks("/api/health/ready", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
-        {
-            Predicate = check => check.Tags.Contains("ready")
-        });
+        app.MapMiniCommerceHealthEndpoints();
 
         return app;
     }
 
-    /// <summary>
-    /// Registers API services and dependencies.
-    /// </summary>
-    /// <param name="builder">The web application builder.</param>
-    /// <returns>The web application builder.</returns>
     public static WebApplicationBuilder AddOrderServiceApi(this WebApplicationBuilder builder)
     {
-        builder.Services.Configure<ObservabilityOptions>(
-            builder.Configuration.GetSection(ObservabilityOptions.SectionName));
+        builder.AddMiniCommerceAksHosting();
+        builder.Services.AddMiniCommerceOptions(builder.Configuration);
+        builder.Services.AddMiniCommerceTelemetry(builder.Configuration);
+        new ServiceBusServiceRegistrar().Register(builder.Services, builder.Configuration, registerConsumer: false);
 
         builder.Services.AddControllers();
         builder.Services.AddEndpointsApiExplorer();
@@ -87,59 +70,56 @@ public static class WebApplicationExtensions
             }
         });
 
-        var connectionString = builder.Configuration.GetConnectionString("OrderDB");
-        builder.Services.AddHealthChecks()
-            .AddCheck("self", () => Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckResult.Healthy(), tags: ["live"])
-            .AddSqlServer(
-                connectionString ?? "Server=.;Database=OrderDB;Trusted_Connection=True;",
-                name: "sqlserver",
-                tags: ["ready"]);
-
-        var allowedOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>()
-            ?? ["http://localhost:5173"];
-
-        builder.Services.AddCors(options =>
-        {
-            options.AddPolicy("FrontendPolicy", policy =>
-            {
-                policy.WithOrigins(allowedOrigins)
-                    .AllowAnyHeader()
-                    .AllowAnyMethod();
-            });
-        });
+        var connectionString = builder.Configuration.GetRequiredSqlConnectionString(ConnectionStringNames.OrderDB);
+        builder.Services.AddMiniCommerceHealthChecks(builder.Configuration, connectionString);
+        builder.Services.AddMiniCommerceCors(builder.Configuration);
 
         builder.Services.AddApplication();
         builder.Services.AddInfrastructure(builder.Configuration);
         builder.Services.AddMiniCommerceJwtAuthentication(builder.Configuration);
 
-        var inventoryBaseUrl = builder.Configuration["Services:Inventory"] ?? "http://localhost:8081";
-        var notificationBaseUrl = builder.Configuration["Services:Notification"] ?? "http://localhost:8082";
+        var downstream = builder.Configuration.GetSection(DownstreamServicesOptions.SectionName).Get<DownstreamServicesOptions>()
+            ?? new DownstreamServicesOptions();
+        var serviceBus = builder.Configuration.GetSection(ServiceBusOptions.SectionName).Get<ServiceBusOptions>()
+            ?? new ServiceBusOptions();
+        var httpTimeout = TimeSpan.FromSeconds(Math.Max(1, downstream.HttpClientTimeoutSeconds));
+
+        RequireAbsoluteServiceUrl(downstream.Inventory, "Services:Inventory", "Services__Inventory");
 
         builder.Services.AddHttpClient<OrderService.Application.Interfaces.IInventoryClient, OrderService.Infrastructure.Integration.InventoryHttpClient>(client =>
         {
-            client.BaseAddress = new Uri(inventoryBaseUrl);
-            client.Timeout = TimeSpan.FromSeconds(30);
+            client.BaseAddress = new Uri(downstream.Inventory);
+            client.Timeout = httpTimeout;
         });
 
-        builder.Services.Configure<OrderService.Infrastructure.Integration.ServiceBusOptions>(
-            builder.Configuration.GetSection(OrderService.Infrastructure.Integration.ServiceBusOptions.SectionName));
-
-        var serviceBusEnabled = builder.Configuration.GetValue("ServiceBus:Enabled", false);
-        if (serviceBusEnabled)
+        if (serviceBus.Enabled)
         {
             builder.Services.AddSingleton<OrderService.Application.Interfaces.IIntegrationEventPublisher,
                 OrderService.Infrastructure.Integration.ServiceBusIntegrationEventPublisher>();
         }
         else
         {
+            RequireAbsoluteServiceUrl(downstream.Notification, "Services:Notification", "Services__Notification");
             builder.Services.AddHttpClient<OrderService.Application.Interfaces.IIntegrationEventPublisher,
                 OrderService.Infrastructure.Integration.NotificationHttpPublisher>(client =>
             {
-                client.BaseAddress = new Uri(notificationBaseUrl);
-                client.Timeout = TimeSpan.FromSeconds(30);
+                client.BaseAddress = new Uri(downstream.Notification);
+                client.Timeout = httpTimeout;
             });
         }
 
         return builder;
+    }
+
+    private static void RequireAbsoluteServiceUrl(string? url, string configKey, string envKey)
+    {
+        if (string.IsNullOrWhiteSpace(url)
+            || !Uri.TryCreate(url, UriKind.Absolute, out var uri)
+            || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+        {
+            throw new InvalidOperationException(
+                $"{configKey} must be an absolute http(s) URL. Set {envKey} for Kubernetes " +
+                $"(e.g. http://inventory-service:8080). Localhost defaults are not used.");
+        }
     }
 }

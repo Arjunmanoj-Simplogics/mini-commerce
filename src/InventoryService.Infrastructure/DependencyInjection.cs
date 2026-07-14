@@ -5,6 +5,9 @@ using InventoryService.Infrastructure.Repositories;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using MiniCommerce.BuildingBlocks.Configuration;
+using MiniCommerce.BuildingBlocks.Data;
 
 namespace InventoryService.Infrastructure;
 
@@ -12,15 +15,13 @@ public static class DependencyInjection
 {
     public static IServiceCollection AddInfrastructure(this IServiceCollection services, IConfiguration configuration)
     {
-        var connectionString = configuration.GetConnectionString("InventoryDB")
-            ?? throw new InvalidOperationException("Connection string 'InventoryDB' is not configured.");
+        var connectionString = configuration.GetRequiredSqlConnectionString(ConnectionStringNames.InventoryDB);
 
         services.AddDbContext<InventoryDbContext>(options =>
-            options.UseSqlServer(connectionString, sql =>
-            {
-                sql.MigrationsAssembly(typeof(InventoryDbContext).Assembly.FullName);
-                sql.EnableRetryOnFailure(3);
-            }));
+            options.UseAzureSqlServer(
+                connectionString,
+                configuration,
+                migrationsAssembly: typeof(InventoryDbContext).Assembly.FullName));
 
         services.AddScoped<IInventoryRepository, InventoryRepository>();
         return services;
@@ -30,6 +31,12 @@ public static class DependencyInjection
     {
         using var scope = serviceProvider.CreateScope();
         var context = scope.ServiceProvider.GetRequiredService<InventoryDbContext>();
+        var logger = scope.ServiceProvider.GetRequiredService<ILoggerFactory>().CreateLogger("InventoryService.Sql");
+        var configuration = scope.ServiceProvider.GetRequiredService<IConfiguration>();
+        var connectionString = configuration.GetRequiredSqlConnectionString(ConnectionStringNames.InventoryDB);
+
+        await AzureSqlExtensions.VerifySqlConnectivityAsync(connectionString, logger, "InventoryDB");
+
         await context.Database.EnsureCreatedAsync();
 
         if (!await context.InventoryItems.AnyAsync())

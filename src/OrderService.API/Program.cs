@@ -1,4 +1,5 @@
-using OrderService.API.Configuration;
+using MiniCommerce.AzureAuth;
+using MiniCommerce.BuildingBlocks.Configuration;
 using OrderService.API.Extensions;
 using OrderService.Infrastructure;
 using Serilog;
@@ -11,6 +12,7 @@ Log.Logger = new LoggerConfiguration()
     .Enrich.FromLogContext()
     .Enrich.WithEnvironmentName()
     .Enrich.WithMachineName()
+    .Enrich.WithProperty("ServiceName", "OrderService")
     .WriteTo.Console()
     .CreateBootstrapLogger();
 
@@ -26,15 +28,18 @@ try
         .Enrich.FromLogContext()
         .Enrich.WithEnvironmentName()
         .Enrich.WithMachineName()
+        .Enrich.WithProperty("ServiceName", "OrderService")
         .WriteTo.Console());
 
+    // Shared DefaultAzureCredential for Blob, Key Vault, Service Bus, Azure SQL (MI in Production)
+    builder.Services.AddMiniCommerceAzureCredential(builder.Configuration);
     builder.AddKeyVaultConfiguration();
     builder.AddOrderServiceApi();
 
     var app = builder.Build();
     app.ConfigurePipeline();
 
-    if (builder.Configuration.GetValue("Database:AutoMigrate", true))
+    if (builder.Configuration.GetSection(SqlOptions.SectionName).Get<SqlOptions>()?.AutoMigrate ?? true)
     {
         await app.Services.InitializeDatabaseAsync();
     }

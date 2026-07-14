@@ -6,7 +6,14 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Tokens;
+using MiniCommerce.AzureAuth;
 using MiniCommerce.BuildingBlocks.Auth;
+using MiniCommerce.BuildingBlocks.Configuration;
+using MiniCommerce.BuildingBlocks.Data;
+using MiniCommerce.BuildingBlocks.Health;
+using MiniCommerce.BuildingBlocks.Hosting;
+using MiniCommerce.BuildingBlocks.Logging;
+using MiniCommerce.BuildingBlocks.Observability;
 using Serilog;
 
 namespace AuthService.API;
@@ -203,42 +210,49 @@ public class Program
         try
         {
             var builder = WebApplication.CreateBuilder(args);
-            builder.Host.UseSerilog((_, _, c) => c.WriteTo.Console().Enrich.FromLogContext());
+            builder.Host.UseSerilog((_, _, c) => c
+                .WriteTo.Console()
+                .Enrich.FromLogContext()
+                .Enrich.WithProperty("ServiceName", "AuthService"));
 
+            builder.Services.AddMiniCommerceAzureCredential(builder.Configuration);
+            builder.AddKeyVaultConfiguration();
+            builder.AddMiniCommerceAksHosting();
+            builder.Services.AddMiniCommerceOptions(builder.Configuration);
+            builder.Services.AddMiniCommerceTelemetry(builder.Configuration);
             builder.Services.AddControllers();
             builder.Services.AddEndpointsApiExplorer();
             builder.Services.AddSwaggerGen();
             builder.Services.AddMiniCommerceJwtAuthentication(builder.Configuration);
 
-            var cs = builder.Configuration.GetConnectionString("AuthDB")
-                ?? throw new InvalidOperationException("ConnectionStrings:AuthDB is required.");
-            builder.Services.AddDbContext<AuthDbContext>(o => o.UseSqlServer(cs));
+            var cs = builder.Configuration.GetRequiredSqlConnectionString(ConnectionStringNames.AuthDB);
+            builder.Services.AddDbContext<AuthDbContext>(o =>
+                o.UseAzureSqlServer(cs, builder.Configuration));
             builder.Services.AddScoped<IAuthService, AuthAppService>();
-            builder.Services.AddHealthChecks()
-                .AddCheck("self", () => Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckResult.Healthy(), tags: ["live"])
-                .AddSqlServer(cs, name: "sqlserver", tags: ["ready"]);
-
-            var origins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>() ?? ["http://localhost:5173"];
-            builder.Services.AddCors(o => o.AddPolicy("FrontendPolicy", p => p.WithOrigins(origins).AllowAnyHeader().AllowAnyMethod()));
+            builder.Services.AddMiniCommerceHealthChecks(builder.Configuration, cs);
+            builder.Services.AddMiniCommerceCors(builder.Configuration);
 
             var app = builder.Build();
+            app.UseMiniCommerceForwardedHeaders();
+            app.UseMiniCommerceHttpsRedirection();
+            app.UseMiniCommerceStructuredLogging();
             if (app.Environment.IsDevelopment())
             {
                 app.UseSwagger();
                 app.UseSwaggerUI();
             }
 
-            app.UseCors("FrontendPolicy");
+            app.UseCors(CorsOptions.FrontendPolicyName);
             app.UseAuthentication();
             app.UseAuthorization();
             app.MapControllers();
-            app.MapHealthChecks("/api/health");
-            app.MapHealthChecks("/api/health/live", new() { Predicate = c => c.Tags.Contains("live") });
-            app.MapHealthChecks("/api/health/ready", new() { Predicate = c => c.Tags.Contains("ready") });
+            app.MapMiniCommerceHealthEndpoints();
 
             using (var scope = app.Services.CreateScope())
             {
                 var db = scope.ServiceProvider.GetRequiredService<AuthDbContext>();
+                var logger = scope.ServiceProvider.GetRequiredService<ILoggerFactory>().CreateLogger("AuthService.Sql");
+                await AzureSqlExtensions.VerifySqlConnectivityAsync(cs, logger, "AuthDB");
                 await db.Database.EnsureCreatedAsync();
                 if (!await db.Users.AnyAsync())
                 {

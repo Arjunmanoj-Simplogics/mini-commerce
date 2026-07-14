@@ -1,3 +1,32 @@
+# Mini Commerce — local development stack
+# Usage: docker compose up -d --build
+# APIs listen on container :8080; host ports 8080–8086. Frontend: http://localhost:3000
+
+name: mini-commerce
+
+x-dotnet-env: &dotnet-common
+  ASPNETCORE_ENVIRONMENT: Development
+  ASPNETCORE_URLS: http://+:8080
+  DOTNET_EnableDiagnostics: "0"
+  AzureAuth__PreferManagedIdentity: "false"
+  OpenTelemetry__Exporters__Console: "false"
+  OpenTelemetry__Exporters__Otlp: "false"
+  OpenTelemetry__Exporters__AzureMonitor: "false"
+  KeyVault__Enabled: "false"
+  Jwt__Issuer: MiniCommerce
+  Jwt__Audience: MiniCommerce
+  Jwt__SigningKey: MiniCommerce_Dev_Signing_Key_Change_In_Production_32chars
+  Cors__AllowedOrigins__0: http://localhost:5173
+  Cors__AllowedOrigins__1: http://localhost:3000
+  Database__AutoMigrate: "true"
+  Database__MaxRetryCount: "5"
+  Database__CommandTimeoutSeconds: "30"
+  Database__MaxRetryDelaySeconds: "30"
+
+x-sql-dep: &sql-healthy
+  sqlserver:
+    condition: service_healthy
+
 services:
   sqlserver:
     image: mcr.microsoft.com/mssql/server:2022-latest
@@ -9,109 +38,130 @@ services:
       - "1433:1433"
     volumes:
       - sqldata:/var/opt/mssql
+    networks:
+      - mini-commerce
     healthcheck:
       test: /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "Your_strong_Password123" -C -Q "SELECT 1" || exit 1
       interval: 10s
       timeout: 5s
-      retries: 10
-      start_period: 30s
+      retries: 12
+      start_period: 40s
+    restart: unless-stopped
 
   auth-service:
     build:
       context: .
       dockerfile: src/AuthService.API/Dockerfile
+    image: minicommerce-auth:local
+    container_name: mini-commerce-auth
     ports:
-      - "8083:8083"
+      - "8083:8080"
     environment:
-      ASPNETCORE_URLS: http://+:8083
+      <<: *dotnet-common
+      OpenTelemetry__ServiceName: AuthService
       ConnectionStrings__AuthDB: "Server=sqlserver,1433;Database=AuthDB;User Id=sa;Password=Your_strong_Password123;TrustServerCertificate=True;Encrypt=False"
-      Jwt__Issuer: MiniCommerce
-      Jwt__Audience: MiniCommerce
-      Jwt__SigningKey: MiniCommerce_Dev_Signing_Key_Change_In_Production_32chars
-      Cors__AllowedOrigins__0: "http://localhost:5173"
     depends_on:
-      sqlserver:
-        condition: service_healthy
+      <<: *sql-healthy
+    networks:
+      - mini-commerce
+    restart: unless-stopped
 
   catalog-service:
     build:
       context: .
       dockerfile: src/CatalogService.API/Dockerfile
+    image: minicommerce-catalog:local
+    container_name: mini-commerce-catalog
     ports:
-      - "8084:8084"
+      - "8084:8080"
     environment:
-      ASPNETCORE_URLS: http://+:8084
+      <<: *dotnet-common
+      OpenTelemetry__ServiceName: CatalogService
       ConnectionStrings__CatalogDB: "Server=sqlserver,1433;Database=CatalogDB;User Id=sa;Password=Your_strong_Password123;TrustServerCertificate=True;Encrypt=False"
-      Jwt__SigningKey: MiniCommerce_Dev_Signing_Key_Change_In_Production_32chars
-      Cors__AllowedOrigins__0: "http://localhost:5173"
+      BlobStorage__Enabled: "false"
     depends_on:
-      sqlserver:
-        condition: service_healthy
+      <<: *sql-healthy
+    networks:
+      - mini-commerce
+    restart: unless-stopped
 
   cart-service:
     build:
       context: .
       dockerfile: src/CartService.API/Dockerfile
+    image: minicommerce-cart:local
+    container_name: mini-commerce-cart
     ports:
-      - "8085:8085"
+      - "8085:8080"
     environment:
-      ASPNETCORE_URLS: http://+:8085
+      <<: *dotnet-common
+      OpenTelemetry__ServiceName: CartService
       ConnectionStrings__CartDB: "Server=sqlserver,1433;Database=CartDB;User Id=sa;Password=Your_strong_Password123;TrustServerCertificate=True;Encrypt=False"
-      Jwt__SigningKey: MiniCommerce_Dev_Signing_Key_Change_In_Production_32chars
-      Cors__AllowedOrigins__0: "http://localhost:5173"
     depends_on:
-      sqlserver:
-        condition: service_healthy
+      <<: *sql-healthy
+    networks:
+      - mini-commerce
+    restart: unless-stopped
 
   inventory-service:
     build:
       context: .
       dockerfile: src/InventoryService.API/Dockerfile
+    image: minicommerce-inventory:local
+    container_name: mini-commerce-inventory
     ports:
-      - "8081:8081"
+      - "8081:8080"
     environment:
-      ASPNETCORE_URLS: http://+:8081
+      <<: *dotnet-common
+      OpenTelemetry__ServiceName: InventoryService
       ConnectionStrings__InventoryDB: "Server=sqlserver,1433;Database=InventoryDB;User Id=sa;Password=Your_strong_Password123;TrustServerCertificate=True;Encrypt=False"
-      Jwt__SigningKey: MiniCommerce_Dev_Signing_Key_Change_In_Production_32chars
-      Cors__AllowedOrigins__0: "http://localhost:5173"
+      ServiceBus__Enabled: "${SERVICEBUS_ENABLED:-false}"
+      ServiceBus__ConnectionString: "${SERVICEBUS_CONNECTION_STRING:-}"
     depends_on:
-      sqlserver:
-        condition: service_healthy
+      <<: *sql-healthy
+    networks:
+      - mini-commerce
+    restart: unless-stopped
 
   notification-service:
     build:
       context: .
       dockerfile: src/NotificationService.API/Dockerfile
+    image: minicommerce-notification:local
+    container_name: mini-commerce-notification
     ports:
-      - "8082:8082"
+      - "8082:8080"
     environment:
-      ASPNETCORE_URLS: http://+:8082
+      <<: *dotnet-common
+      OpenTelemetry__ServiceName: NotificationService
       ConnectionStrings__NotificationDB: "Server=sqlserver,1433;Database=NotificationDB;User Id=sa;Password=Your_strong_Password123;TrustServerCertificate=True;Encrypt=False"
-      Cors__AllowedOrigins__0: "http://localhost:5173"
       ServiceBus__Enabled: "${SERVICEBUS_ENABLED:-false}"
       ServiceBus__ConnectionString: "${SERVICEBUS_CONNECTION_STRING:-}"
-      ServiceBus__TopicName: "orders"
-      ServiceBus__SubscriptionName: "notification-service"
+      ServiceBus__TopicName: orders
+      ServiceBus__SubscriptionName: notification-service
     depends_on:
-      sqlserver:
-        condition: service_healthy
+      <<: *sql-healthy
+    networks:
+      - mini-commerce
+    restart: unless-stopped
 
   order-service:
     build:
       context: .
       dockerfile: src/OrderService.API/Dockerfile
+    image: minicommerce-order:local
+    container_name: mini-commerce-order
     ports:
       - "8080:8080"
     environment:
-      ASPNETCORE_URLS: http://+:8080
+      <<: *dotnet-common
+      OpenTelemetry__ServiceName: OrderService
       ConnectionStrings__OrderDB: "Server=sqlserver,1433;Database=OrderDB;User Id=sa;Password=Your_strong_Password123;TrustServerCertificate=True;Encrypt=False"
-      Services__Inventory: "http://inventory-service:8081"
-      Services__Notification: "http://notification-service:8082"
-      Jwt__SigningKey: MiniCommerce_Dev_Signing_Key_Change_In_Production_32chars
-      Cors__AllowedOrigins__0: "http://localhost:5173"
+      Services__Inventory: http://inventory-service:8080
+      Services__Notification: http://notification-service:8080
       ServiceBus__Enabled: "${SERVICEBUS_ENABLED:-false}"
       ServiceBus__ConnectionString: "${SERVICEBUS_CONNECTION_STRING:-}"
-      ServiceBus__TopicName: "orders"
+      ServiceBus__TopicName: orders
     depends_on:
       sqlserver:
         condition: service_healthy
@@ -121,22 +171,58 @@ services:
         condition: service_started
       auth-service:
         condition: service_started
+    networks:
+      - mini-commerce
+    restart: unless-stopped
 
   payment-service:
     build:
       context: .
       dockerfile: src/PaymentService.API/Dockerfile
+    image: minicommerce-payment:local
+    container_name: mini-commerce-payment
     ports:
-      - "8086:8086"
+      - "8086:8080"
     environment:
-      ASPNETCORE_URLS: http://+:8086
-      Jwt__Issuer: MiniCommerce
-      Jwt__Audience: MiniCommerce
-      Jwt__SigningKey: MiniCommerce_Dev_Signing_Key_Change_In_Production_32chars
-      Cors__AllowedOrigins__0: "http://localhost:5173"
+      <<: *dotnet-common
+      OpenTelemetry__ServiceName: PaymentService
+      ServiceBus__Enabled: "${SERVICEBUS_ENABLED:-false}"
+      ServiceBus__ConnectionString: "${SERVICEBUS_CONNECTION_STRING:-}"
     depends_on:
       auth-service:
         condition: service_started
+    networks:
+      - mini-commerce
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: http://localhost:8080
+        VITE_INVENTORY_API_BASE_URL: http://localhost:8081
+        VITE_NOTIFICATION_API_BASE_URL: http://localhost:8082
+        VITE_AUTH_API_BASE_URL: http://localhost:8083
+        VITE_CATALOG_API_BASE_URL: http://localhost:8084
+        VITE_CART_API_BASE_URL: http://localhost:8085
+        VITE_PAYMENT_API_BASE_URL: http://localhost:8086
+    image: minicommerce-frontend:local
+    container_name: mini-commerce-frontend
+    ports:
+      - "3000:8080"
+    depends_on:
+      - auth-service
+      - catalog-service
+      - order-service
+      - payment-service
+    networks:
+      - mini-commerce
+    restart: unless-stopped
+
+networks:
+  mini-commerce:
+    driver: bridge
 
 volumes:
   sqldata:

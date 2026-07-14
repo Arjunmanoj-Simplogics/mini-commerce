@@ -1,12 +1,14 @@
+using System.Diagnostics;
 using System.Net;
 using System.Text.Json;
-using FluentValidation;
 using Microsoft.EntityFrameworkCore;
+using MiniCommerce.BuildingBlocks.Logging;
 
 namespace OrderService.API.Middleware;
 
 /// <summary>
 /// Catches unhandled exceptions and returns standardized error responses.
+/// Logs with ILogger using CorrelationId, RequestId, TraceId, and Exception.
 /// </summary>
 public class GlobalExceptionMiddleware
 {
@@ -19,12 +21,6 @@ public class GlobalExceptionMiddleware
     private readonly ILogger<GlobalExceptionMiddleware> _logger;
     private readonly IHostEnvironment _environment;
 
-    /// <summary>
-    /// Initializes a new instance of the <see cref="GlobalExceptionMiddleware"/> class.
-    /// </summary>
-    /// <param name="next">The next middleware delegate.</param>
-    /// <param name="logger">The logger.</param>
-    /// <param name="environment">The hosting environment.</param>
     public GlobalExceptionMiddleware(
         RequestDelegate next,
         ILogger<GlobalExceptionMiddleware> logger,
@@ -35,10 +31,6 @@ public class GlobalExceptionMiddleware
         _environment = environment;
     }
 
-    /// <summary>
-    /// Invokes the middleware.
-    /// </summary>
-    /// <param name="context">The HTTP context.</param>
     public async Task InvokeAsync(HttpContext context)
     {
         try
@@ -62,13 +54,38 @@ public class GlobalExceptionMiddleware
             _ => (HttpStatusCode.InternalServerError, "An unexpected error occurred")
         };
 
+        var correlationId = context.Items.TryGetValue(LoggingContextKeys.CorrelationId, out var c) ? c?.ToString() : null
+            ?? context.Request.Headers[CorrelationLoggingMiddleware.CorrelationHeader].FirstOrDefault()
+            ?? string.Empty;
+        var requestId = context.Items.TryGetValue(LoggingContextKeys.RequestId, out var r) ? r?.ToString() : null
+            ?? context.TraceIdentifier;
+        var traceId = context.Items.TryGetValue(LoggingContextKeys.TraceId, out var t) ? t?.ToString() : null
+            ?? Activity.Current?.TraceId.ToString()
+            ?? context.TraceIdentifier;
+
         if (exception is DbUpdateException dbEx)
         {
-            _logger.LogError(dbEx, "Database failure processing {Method} {Path}", context.Request.Method, context.Request.Path);
+            _logger.LogError(
+                dbEx,
+                "Database failure processing {RequestMethod} {RequestPath} CorrelationId={CorrelationId} RequestId={RequestId} TraceId={TraceId} Exception={ExceptionType}",
+                context.Request.Method,
+                context.Request.Path,
+                correlationId,
+                requestId,
+                traceId,
+                dbEx.GetType().Name);
         }
         else
         {
-            _logger.LogError(exception, "Unhandled exception processing {Method} {Path}", context.Request.Method, context.Request.Path);
+            _logger.LogError(
+                exception,
+                "Unhandled exception processing {RequestMethod} {RequestPath} CorrelationId={CorrelationId} RequestId={RequestId} TraceId={TraceId} Exception={ExceptionType}",
+                context.Request.Method,
+                context.Request.Path,
+                correlationId,
+                requestId,
+                traceId,
+                exception.GetType().Name);
         }
 
         context.Response.ContentType = "application/problem+json";
@@ -80,7 +97,9 @@ public class GlobalExceptionMiddleware
             title,
             status = (int)statusCode,
             detail = _environment.IsDevelopment() ? exception.Message : title,
-            traceId = context.TraceIdentifier
+            traceId,
+            correlationId,
+            requestId
         };
 
         await context.Response.WriteAsync(JsonSerializer.Serialize(problem, JsonOptions));
